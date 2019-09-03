@@ -28,13 +28,13 @@ impl Editor {
             screen_rows: 0,
             screen_cols: 0,
         };
+        editor.enable_raw_mode();
         editor.clear_screen();
         editor.get_window_size();
         println!(
-            "Window Rows: {0}, Cols: {1}\r",
+            "Rows: {0}, Cols; {1}",
             editor.screen_rows, editor.screen_cols
         );
-        editor.read_key();
         editor
     }
 
@@ -72,8 +72,8 @@ impl Editor {
         raw.c_cflag |= CS8;
         raw.c_lflag &= !(ECHO | ICANON | IEXTEN | ISIG);
         // Set timeout on reads
-        raw.c_cc[VMIN] = 0;
-        raw.c_cc[VTIME] = 1;
+        // raw.c_cc[VMIN] = 0;
+        // raw.c_cc[VTIME] = 1;
 
         // Set flags and return
         tcsetattr(self.stdin_fileno, TCSAFLUSH, &raw).expect("Error setting terminal to raw mode");
@@ -93,18 +93,21 @@ impl Editor {
 
     fn get_window_size(&mut self) {
         let mut ws = libc::winsize {
-            ws_col: 1,
+            ws_col: 0,
             ws_row: 0,
             ws_ypixel: 0,
             ws_xpixel: 0,
         };
         unsafe {
-            if true || ioctl(self.stdout_fileno, libc::TIOCGWINSZ, &mut ws) == 0 || ws.ws_col == 0 {
+            // try using libc's ioctl tp get the terminal size
+            if ioctl(self.stdout_fileno, libc::TIOCGWINSZ, &mut ws) == 0 || ws.ws_col == 0 {
+                // if that fails we need to do it manually so...
+                // Move the cursor to bottom right corner of the screen
                 if stdout().write(b"\x1b[999C\x1b[999B").unwrap() != 12 {
                     panic!("Unable to get screen size with fallback method");
                 } else {
+                    // Use the cursor's location to tell the size of the window
                     self.get_cursor_position();
-                    self.read_key();
                     return;
                 }
             } else {
@@ -115,25 +118,47 @@ impl Editor {
     }
 
     fn get_cursor_position(&mut self) {
-        let mut buf = [0; 8];
-        let mut should_break = true;
+        let mut buf = [0; 32];
+        let mut rows: u16 = 0;
+        let mut cols: u16 = 0;
+        let mut index: usize = 0;
+        // Send the command to get cursor position. We will be able to read the response at stdin
         if stdout().write(b"\x1b[6n").unwrap() != 4 {
             panic!("Failed at get cursor position in fallback method")
         }
-        // while !should_break {
-        //     stdin().read(&mut buf).unwrap();
-        //     // for c in buf.iter() {
-        //     //     if c == &('R' as u8) {
-        //     //         should_break = true;
-        //     //         break;
-        //     //     }
-        //     // }
-        // }
-        // println!("{:?}\r", buf);
-        self.read_key();
-
-        // self.screen_rows = buf[1] as u16;
-        // self.screen_cols = buf[0] as u16;
+        // Force flush so buffering doesn't throw off the timing of our read
+        stdout().flush().unwrap();
+        // Read the value returned by the terminal
+        stdin().read(&mut buf).unwrap();
+        // The buffer now contains "\x1b[" (chars 71, 91) at some index
+        // we want to find that index
+        for i in 0..buf.len() {
+            if buf[i] == 27 && buf[i + 1] == 91 {
+                index = i;
+                break;
+            }
+        }
+        if buf[index] != 27 || buf[index + 1] != 91 {
+            panic!("Did not read cursor position!");
+        }
+        // After "\x1b[" is the row number followed by a semicolon (char 59)
+        index = index + 2;
+        while buf[index] != 59 {
+            // Convert the ascii row number to an integer
+            rows = rows * 10;
+            rows = rows + (buf[index] - 48) as u16;
+            index = index + 1;
+        }
+        // After the semicolon (char 59) is the col number followed by 'R' (char 82)
+        index = index + 1;
+        while buf[index] != 82 {
+            // Convert each the ascii col number to an integer
+            cols = cols * 10;
+            cols = cols + (buf[index] - 48) as u16;
+            index = index + 1;
+        }
+        self.screen_rows = rows;
+        self.screen_cols = cols;
     }
 
     // *** INPUT ***
@@ -147,37 +172,39 @@ impl Editor {
     }
 
     fn run(&self) {
-        self.process_keypress();
-        // loop {
-        //     self.refresh_screen();
-        //     self.process_keypress();
-        // }
-        // disable_raw_mode(ORIG_TERMIOS);
+        loop {
+            self.refresh_screen();
+            self.process_keypress();
+        }
     }
 
     // *** OUTPUT ***
     fn refresh_screen(&self) {
-        self.clear_screen();
-        self.draw_rows();
-        // Move cursor back to top left
-        stdout().write(b"\x1b[H").unwrap();
+        let mut output = String::new();
+        // Hide cursor, Move to top left
+        output.push_str("\x1b[?25l\x1b[H");
+        // Clear rows and push new contents to output string
+        self.draw_rows(&mut output);
+        // Move cursor to top left and show
+        output.push_str("\x1b[H\x1b[?25h");
+        // Write all commands to stdout at once
+        stdout().write(output.as_bytes()).unwrap();
     }
-    fn draw_rows(&self) {
-        for _ in 0..=self.screen_rows {
-            stdout().write(b"~\r\n").unwrap();
+    fn draw_rows(&self, output: &mut String) {
+        for _ in 0..self.screen_rows - 1 {
+            // Write a tilde, clear the rest of the line, then return and newline
+            output.push_str("~\x1b[K\r\n");
         }
+        output.push_str("~\x1b[K");
     }
     fn clear_screen(&self) {
-        // Clear screen
-        stdout().write(b"\x1b[2J").unwrap();
-        // Move cursor to top left
-        stdout().write(b"\x1b[H").unwrap();
+        // Clear screen, move cursor to top left
+        stdout().write(b"\x1b[2J\x1b[H").unwrap();
     }
 }
 // *** INIT ***
 fn main() {
     let editor = Editor::new();
-    editor.enable_raw_mode();
     match catch_unwind(|| editor.run()) {
         Ok(_) => (),
         Err(e) => {
@@ -186,5 +213,5 @@ fn main() {
             panic!(e)
         }
     }
-    editor.disable_raw_mode();
+    editor.disable_raw_mode()
 }
