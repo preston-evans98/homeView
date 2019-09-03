@@ -1,6 +1,6 @@
 use std::io::{stdin, stdout, ErrorKind, Read, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::panic::catch_unwind;
+// use std::panic::catch_unwind;
 
 extern crate termios;
 use termios::Termios;
@@ -15,8 +15,19 @@ struct Editor {
     orig_termios: Termios,
     stdin_fileno: RawFd,
     stdout_fileno: RawFd,
-    screen_rows: u16,
-    screen_cols: u16,
+    // Cursor x, cursor y
+    cx: usize,
+    cy: usize,
+    screen_rows: usize,
+    screen_cols: usize,
+    // version: &'static str,
+}
+
+impl Drop for Editor {
+    fn drop(&mut self) {
+        self.clear_screen();
+        self.disable_raw_mode();
+    }
 }
 
 impl Editor {
@@ -27,6 +38,9 @@ impl Editor {
             stdout_fileno: stdout().as_raw_fd(),
             screen_rows: 0,
             screen_cols: 0,
+            cx: 1,
+            cy: 0,
+            // version: "0.0.1",
         };
         editor.enable_raw_mode();
         editor.clear_screen();
@@ -38,9 +52,9 @@ impl Editor {
         editor
     }
 
-    fn iscntrl(&self, c: u8) -> bool {
-        c <= 31
-    }
+    // fn iscntrl(&self, c: u8) -> bool {
+    //     c <= 31
+    // }
 
     // #[allow(non_snake_case)]
     // // returns the asci value of ctrl+{c}
@@ -72,17 +86,53 @@ impl Editor {
         raw.c_cflag |= CS8;
         raw.c_lflag &= !(ECHO | ICANON | IEXTEN | ISIG);
         // Set timeout on reads
-        // raw.c_cc[VMIN] = 0;
-        // raw.c_cc[VTIME] = 1;
+        raw.c_cc[VMIN] = 0;
+        raw.c_cc[VTIME] = 1;
 
         // Set flags and return
         tcsetattr(self.stdin_fileno, TCSAFLUSH, &raw).expect("Error setting terminal to raw mode");
     }
 
     fn read_key(&self) -> u8 {
+        // Buffer for next character
         let mut next = [0; 1];
+        // let mut seq = [0; 3];
         match stdin().read_exact(&mut next) {
-            Ok(_) => next[0],
+            Ok(_) => {
+                match next[0] {
+                    27 => {
+                        // Buffer for escape sequence.
+                        let mut seq = [0; 3];
+                        match stdin().read(&mut seq) {
+                            Ok(_) => {
+                                // if we get '[' at position zero it's a generated response
+                                if seq[0] == 91 {
+                                    match seq[1] {
+                                        // A => w
+                                        65 => 119,
+                                        // B => s
+                                        66 => 115,
+                                        // C => d
+                                        67 => 100,
+                                        // D => a
+                                        68 => 97,
+                                        0 => next[0],
+                                        _ => next[0],
+                                    }
+                                } else {
+                                    next[0]
+                                }
+                            }
+                            Err(e) => match e.kind() {
+                                // If our read timed out, set c to zero
+                                ErrorKind::UnexpectedEof => 0,
+                                _ => panic!(e),
+                            },
+                        }
+                    }
+                    _ => next[0],
+                }
+            }
             Err(e) => match e.kind() {
                 // If our read timed out, set c to zero
                 ErrorKind::UnexpectedEof => 0,
@@ -90,7 +140,19 @@ impl Editor {
             },
         }
     }
+    // match next[1] {
+    //                         // A => w
+    //                         65 => 119,
+    //                         // B => s
+    //                         66 => 115,
+    //                         // C => d
+    //                         67 => 100,
+    //                         // D => a
+    //                         68 => 97,
+    //                         0 => next[0],
+    //                         _ => next[0]
 
+    //                     },
     fn get_window_size(&mut self) {
         let mut ws = libc::winsize {
             ws_col: 0,
@@ -104,34 +166,34 @@ impl Editor {
                 // if that fails we need to do it manually so...
                 // Move the cursor to bottom right corner of the screen
                 if stdout().write(b"\x1b[999C\x1b[999B").unwrap() != 12 {
-                    panic!("Unable to get screen size with fallback method");
+                    panic!("Unable to move to bottom right corner");
                 } else {
                     // Use the cursor's location to tell the size of the window
                     self.get_cursor_position();
                     return;
                 }
             } else {
-                self.screen_rows = ws.ws_row;
-                self.screen_cols = ws.ws_col;
+                self.screen_rows = ws.ws_row as usize;
+                self.screen_cols = ws.ws_col as usize;
             }
         }
     }
 
     fn get_cursor_position(&mut self) {
         let mut buf = [0; 32];
-        let mut rows: u16 = 0;
-        let mut cols: u16 = 0;
+        let mut rows: usize = 0;
+        let mut cols: usize = 0;
         let mut index: usize = 0;
         // Send the command to get cursor position. We will be able to read the response at stdin
         if stdout().write(b"\x1b[6n").unwrap() != 4 {
             panic!("Failed at get cursor position in fallback method")
         }
-        // Force flush so buffering doesn't throw off the timing of our read
+        // Force flush so buffering doesn't delay our command
         stdout().flush().unwrap();
         // Read the value returned by the terminal
         stdin().read(&mut buf).unwrap();
         // The buffer now contains "\x1b[" (chars 71, 91) at some index
-        // we want to find that index
+        // we want to find that index. The full response is "\x1b{rows};{cols}R"
         for i in 0..buf.len() {
             if buf[i] == 27 && buf[i + 1] == 91 {
                 index = i;
@@ -146,15 +208,15 @@ impl Editor {
         while buf[index] != 59 {
             // Convert the ascii row number to an integer
             rows = rows * 10;
-            rows = rows + (buf[index] - 48) as u16;
+            rows = rows + (buf[index] - 48) as usize;
             index = index + 1;
         }
         // After the semicolon (char 59) is the col number followed by 'R' (char 82)
         index = index + 1;
         while buf[index] != 82 {
-            // Convert each the ascii col number to an integer
+            // Convert the ascii col number to an integer
             cols = cols * 10;
-            cols = cols + (buf[index] - 48) as u16;
+            cols = cols + (buf[index] - 48) as usize;
             index = index + 1;
         }
         self.screen_rows = rows;
@@ -162,16 +224,48 @@ impl Editor {
     }
 
     // *** INPUT ***
-    fn process_keypress(&self) {
+    fn process_keypress(&mut self) {
         let c = self.read_key();
         match c {
+            // Nothing - do nothing
+            0 => (),
+            // w, a s, d
+            97 | 100 | 115 | 119 => self.move_cursor(c),
             // CTRL_KEY('q')
             17 => self.exit(),
+            107 => self.refresh_screen(),
             _ => println!("{}\r", c),
         }
     }
 
-    fn run(&self) {
+    fn move_cursor(&mut self, c: u8) {
+        match c as char {
+            'w' => {
+                if self.cy > 0 {
+                    self.cy = self.cy - 1
+                }
+            }
+            's' => {
+                if self.cy < self.screen_rows {
+                    self.cy = self.cy + 1
+                }
+            }
+            'a' => {
+                if self.cx > 1 {
+                    self.cx = self.cx - 1
+                }
+            }
+            'd' => {
+                if self.cx < self.screen_cols {
+                    self.cx = self.cx + 1
+                }
+            }
+            _ => (),
+        }
+    }
+
+    fn run(&mut self) {
+        // self.refresh_screen();
         loop {
             self.refresh_screen();
             self.process_keypress();
@@ -185,15 +279,38 @@ impl Editor {
         output.push_str("\x1b[?25l\x1b[H");
         // Clear rows and push new contents to output string
         self.draw_rows(&mut output);
+        let cursor_position = format!("\x1b[{0};{1}H", self.cy + 1, self.cx + 1);
         // Move cursor to top left and show
-        output.push_str("\x1b[H\x1b[?25h");
+        output.push_str(&cursor_position);
+        output.push_str("\x1b[?25h");
         // Write all commands to stdout at once
         stdout().write(output.as_bytes()).unwrap();
+        stdout().flush().unwrap();
     }
     fn draw_rows(&self, output: &mut String) {
-        for _ in 0..self.screen_rows - 1 {
-            // Write a tilde, clear the rest of the line, then return and newline
-            output.push_str("~\x1b[K\r\n");
+        let welcome_msg = concat!(
+            "ViMacs Editor -- Version ",
+            env!("CARGO_PKG_VERSION"),
+            "\r\n"
+        );
+        for i in 0..self.screen_rows - 1 {
+            if i == self.screen_rows / 3 {
+                if welcome_msg.len() > self.screen_cols {
+                    output.push_str(&welcome_msg[0..self.screen_cols]);
+                } else {
+                    let padding = (self.screen_cols - welcome_msg.len()) / 2;
+                    if padding > 0 {
+                        output.push_str("~");
+                    }
+                    for _ in 0..padding - 1 {
+                        output.push_str(" ");
+                    }
+                    output.push_str(&welcome_msg);
+                }
+            } else {
+                // Write a tilde, clear the rest of the line, then return and newline
+                output.push_str("~\x1b[K\r\n");
+            }
         }
         output.push_str("~\x1b[K");
     }
@@ -204,14 +321,6 @@ impl Editor {
 }
 // *** INIT ***
 fn main() {
-    let editor = Editor::new();
-    match catch_unwind(|| editor.run()) {
-        Ok(_) => (),
-        Err(e) => {
-            editor.clear_screen();
-            editor.disable_raw_mode();
-            panic!(e)
-        }
-    }
-    editor.disable_raw_mode()
+    let mut editor = Editor::new();
+    editor.run()
 }
