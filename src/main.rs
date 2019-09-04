@@ -19,6 +19,7 @@ const PAGE_UP: u16 = 1004;
 const PAGE_DOWN: u16 = 1005;
 const HOME_KEY: u16 = 1006;
 const END_KEY: u16 = 1007;
+const DELETE_KEY: u16 = 1008;
 const LEFT_BRACKET: u8 = 91;
 const ESCAPE: u8 = 27;
 
@@ -125,6 +126,7 @@ impl Editor {
                                         {
                                             match seq[1] {
                                                 1 => HOME_KEY,
+                                                3 => DELETE_KEY,
                                                 4 => END_KEY,
                                                 5 => PAGE_UP,
                                                 6 => PAGE_DOWN,
