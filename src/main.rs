@@ -11,6 +11,17 @@ use libc::ioctl;
 // use nix::sys::ioctl;
 
 // *** Defines ***
+const ARROW_UP: u16 = 1000;
+const ARROW_LEFT: u16 = 1001;
+const ARROW_RIGHT: u16 = 1002;
+const ARROW_DOWN: u16 = 1003;
+const PAGE_UP: u16 = 1004;
+const PAGE_DOWN: u16 = 1005;
+const HOME_KEY: u16 = 1006;
+const END_KEY: u16 = 1007;
+const LEFT_BRACKET: u8 = 91;
+const ESCAPE: u8 = 27;
+
 struct Editor {
     orig_termios: Termios,
     stdin_fileno: RawFd,
@@ -31,6 +42,7 @@ impl Drop for Editor {
 }
 
 impl Editor {
+    // use crate::EditorKey;
     pub fn new() -> Editor {
         let mut editor = Editor {
             orig_termios: Termios::from_fd(stdin().as_raw_fd()).unwrap(),
@@ -93,34 +105,80 @@ impl Editor {
         tcsetattr(self.stdin_fileno, TCSAFLUSH, &raw).expect("Error setting terminal to raw mode");
     }
 
-    fn read_key(&self) -> u8 {
+    fn read_key(&self) -> u16 {
         // Buffer for next character
         let mut next = [0; 1];
         // let mut seq = [0; 3];
         match stdin().read_exact(&mut next) {
             Ok(_) => {
                 match next[0] {
-                    27 => {
+                    ESCAPE => {
                         // Buffer for escape sequence.
                         let mut seq = [0; 3];
                         match stdin().read(&mut seq) {
                             Ok(_) => {
                                 // if we get '[' at position zero it's a generated response
-                                if seq[0] == 91 {
+                                if seq[0] == LEFT_BRACKET {
+                                    if seq[1] >= '0' as u8 && seq[1] <= '9' as u8 {
+                                        if seq[2] == '~' as u8
+                                        //|| seq[2] == 'C' as u8
+                                        {
+                                            match seq[1] {
+                                                1 => HOME_KEY,
+                                                4 => END_KEY,
+                                                5 => PAGE_UP,
+                                                6 => PAGE_DOWN,
+                                                7 => HOME_KEY,
+                                                8 => END_KEY,
+                                                53 => PAGE_UP,
+                                                54 => PAGE_DOWN,
+                                                _ => ESCAPE as u16,
+                                            }
+                                        } else {
+                                            ESCAPE as u16
+                                        }
+                                    } else {
+                                        match seq[1] {
+                                            53 => PAGE_UP,
+                                            54 => PAGE_DOWN,
+                                            // A
+                                            65 => ARROW_UP,
+                                            // B
+                                            66 => ARROW_DOWN,
+                                            // C
+                                            67 => ARROW_RIGHT,
+                                            // D
+                                            68 => ARROW_LEFT,
+                                            // H
+                                            72 => HOME_KEY,
+                                            // F
+                                            70 => END_KEY,
+                                            // H
+                                            _ => ESCAPE as u16,
+                                        }
+                                    }
+                                } else if seq[0] == 'O' as u8 {
                                     match seq[1] {
-                                        // A => w
-                                        65 => 119,
-                                        // B => s
-                                        66 => 115,
-                                        // C => d
-                                        67 => 100,
-                                        // D => a
-                                        68 => 97,
-                                        0 => next[0],
-                                        _ => next[0],
+                                        // H
+                                        72 => HOME_KEY,
+                                        // F
+                                        70 => END_KEY,
+                                        _ => ESCAPE as u16,
+                                    }
+                                } else if seq[0] == 'C' as u8 {
+                                    match seq[1] {
+                                        // A
+                                        65 => PAGE_UP,
+                                        // B
+                                        66 => PAGE_DOWN,
+                                        // C
+                                        67 => END_KEY,
+                                        // D
+                                        68 => HOME_KEY,
+                                        _ => ESCAPE as u16,
                                     }
                                 } else {
-                                    next[0]
+                                    ESCAPE as u16
                                 }
                             }
                             Err(e) => match e.kind() {
@@ -130,7 +188,7 @@ impl Editor {
                             },
                         }
                     }
-                    _ => next[0],
+                    _ => next[0] as u16,
                 }
             }
             Err(e) => match e.kind() {
@@ -140,19 +198,6 @@ impl Editor {
             },
         }
     }
-    // match next[1] {
-    //                         // A => w
-    //                         65 => 119,
-    //                         // B => s
-    //                         66 => 115,
-    //                         // C => d
-    //                         67 => 100,
-    //                         // D => a
-    //                         68 => 97,
-    //                         0 => next[0],
-    //                         _ => next[0]
-
-    //                     },
     fn get_window_size(&mut self) {
         let mut ws = libc::winsize {
             ws_col: 0,
@@ -160,6 +205,7 @@ impl Editor {
             ws_ypixel: 0,
             ws_xpixel: 0,
         };
+        // only the call to ioctl is unsafe in this block.
         unsafe {
             // try using libc's ioctl tp get the terminal size
             if ioctl(self.stdout_fileno, libc::TIOCGWINSZ, &mut ws) == 0 || ws.ws_col == 0 {
@@ -195,12 +241,12 @@ impl Editor {
         // The buffer now contains "\x1b[" (chars 71, 91) at some index
         // we want to find that index. The full response is "\x1b{rows};{cols}R"
         for i in 0..buf.len() {
-            if buf[i] == 27 && buf[i + 1] == 91 {
+            if buf[i] == ESCAPE && buf[i + 1] == LEFT_BRACKET {
                 index = i;
                 break;
             }
         }
-        if buf[index] != 27 || buf[index + 1] != 91 {
+        if buf[index] != ESCAPE || buf[index + 1] != LEFT_BRACKET {
             panic!("Did not read cursor position!");
         }
         // After "\x1b[" is the row number followed by a semicolon (char 59)
@@ -229,8 +275,11 @@ impl Editor {
         match c {
             // Nothing - do nothing
             0 => (),
-            // w, a s, d
-            97 | 100 | 115 | 119 => self.move_cursor(c),
+            ARROW_UP | ARROW_DOWN | ARROW_LEFT | ARROW_RIGHT => self.move_cursor(c),
+            PAGE_DOWN => self.cy = self.screen_rows - 1,
+            PAGE_UP => self.cy = 0,
+            HOME_KEY => self.cx = 1,
+            END_KEY => self.cx = self.screen_cols - 1,
             // CTRL_KEY('q')
             17 => self.exit(),
             107 => self.refresh_screen(),
@@ -238,24 +287,24 @@ impl Editor {
         }
     }
 
-    fn move_cursor(&mut self, c: u8) {
-        match c as char {
-            'w' => {
+    fn move_cursor(&mut self, c: u16) {
+        match c {
+            ARROW_UP => {
                 if self.cy > 0 {
                     self.cy = self.cy - 1
                 }
             }
-            's' => {
+            ARROW_DOWN => {
                 if self.cy < self.screen_rows {
                     self.cy = self.cy + 1
                 }
             }
-            'a' => {
+            ARROW_LEFT => {
                 if self.cx > 1 {
                     self.cx = self.cx - 1
                 }
             }
-            'd' => {
+            ARROW_RIGHT => {
                 if self.cx < self.screen_cols {
                     self.cx = self.cx + 1
                 }
