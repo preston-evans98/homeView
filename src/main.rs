@@ -1,12 +1,14 @@
-use std::io::{stdin, stdout, ErrorKind, Read, Write};
+use std::env;
+use std::fs::File;
+use std::io::{stdin, stdout, BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
 // use std::panic::catch_unwind;
 
 extern crate termios;
 use termios::Termios;
 
-extern crate libc;
-use libc::ioctl;
+// extern crate libc;
+// use libc::ioctl;
 // extern crate nix;
 // use nix::sys::ioctl;
 
@@ -26,18 +28,22 @@ const ESCAPE: u8 = 27;
 struct Editor {
     orig_termios: Termios,
     stdin_fileno: RawFd,
-    stdout_fileno: RawFd,
+    // stdout_fileno: RawFd,
     // Cursor x, cursor y
     cx: usize,
     cy: usize,
+    row_offset: usize,
+    col_offset: usize,
     screen_rows: usize,
     screen_cols: usize,
-    // version: &'static str,
+    tab_stop: usize,
+    rx: usize,
+    rows: Vec<String>, // version: &'static str
 }
 
 impl Drop for Editor {
     fn drop(&mut self) {
-        self.clear_screen();
+        // self.clear_screen();
         self.disable_raw_mode();
     }
 }
@@ -48,32 +54,23 @@ impl Editor {
         let mut editor = Editor {
             orig_termios: Termios::from_fd(stdin().as_raw_fd()).unwrap(),
             stdin_fileno: stdin().as_raw_fd(),
-            stdout_fileno: stdout().as_raw_fd(),
+            // stdout_fileno: stdout().as_raw_fd(),
             screen_rows: 0,
             screen_cols: 0,
             cx: 1,
             cy: 0,
+            row_offset: 0,
+            col_offset: 0,
+            rows: Vec::new(),
+            tab_stop: 4,
+            rx: 0,
             // version: "0.0.1",
         };
         editor.enable_raw_mode();
         editor.clear_screen();
         editor.get_window_size();
-        println!(
-            "Rows: {0}, Cols; {1}",
-            editor.screen_rows, editor.screen_cols
-        );
         editor
     }
-
-    // fn iscntrl(&self, c: u8) -> bool {
-    //     c <= 31
-    // }
-
-    // #[allow(non_snake_case)]
-    // // returns the asci value of ctrl+{c}
-    // fn CTRL_KEY(c: char) -> u8 {
-    //     c as u8 & 0x1f
-    // }
 
     fn exit(&self) {
         self.clear_screen();
@@ -201,32 +198,15 @@ impl Editor {
         }
     }
     fn get_window_size(&mut self) {
-        let mut ws = libc::winsize {
-            ws_col: 0,
-            ws_row: 0,
-            ws_ypixel: 0,
-            ws_xpixel: 0,
-        };
-        // only the call to ioctl is unsafe in this block.
-        unsafe {
-            // try using libc's ioctl tp get the terminal size
-            if ioctl(self.stdout_fileno, libc::TIOCGWINSZ, &mut ws) == 0 || ws.ws_col == 0 {
-                // if that fails we need to do it manually so...
-                // Move the cursor to bottom right corner of the screen
-                if stdout().write(b"\x1b[999C\x1b[999B").unwrap() != 12 {
-                    panic!("Unable to move to bottom right corner");
-                } else {
-                    // Use the cursor's location to tell the size of the window
-                    self.get_cursor_position();
-                    return;
-                }
-            } else {
-                self.screen_rows = ws.ws_row as usize;
-                self.screen_cols = ws.ws_col as usize;
-            }
+        // Move the cursor to bottom right corner of the screen
+        if stdout().write(b"\x1b[999C\x1b[999B").unwrap() != 12 {
+            panic!("Unable to move to bottom right corner");
+        } else {
+            // Use the cursor's location to tell the size of the window
+            self.get_cursor_position();
+            return;
         }
     }
-
     fn get_cursor_position(&mut self) {
         let mut buf = [0; 32];
         let mut rows: usize = 0;
@@ -271,6 +251,15 @@ impl Editor {
         self.screen_cols = cols;
     }
 
+    // *** FILE I/O ***
+    fn open(&mut self, file_name: &str) {
+        let file = File::open(file_name).expect(&format!("Could not open {0}", file_name));
+        let buf_reader = BufReader::new(file);
+        for line in buf_reader.lines().map(|l| l.unwrap()) {
+            self.rows.push(line);
+        }
+    }
+
     // *** INPUT ***
     fn process_keypress(&mut self) {
         let c = self.read_key();
@@ -278,10 +267,30 @@ impl Editor {
             // Nothing - do nothing
             0 => (),
             ARROW_UP | ARROW_DOWN | ARROW_LEFT | ARROW_RIGHT => self.move_cursor(c),
-            PAGE_DOWN => self.cy = self.screen_rows - 1,
-            PAGE_UP => self.cy = 0,
-            HOME_KEY => self.cx = 1,
-            END_KEY => self.cx = self.screen_cols - 1,
+            PAGE_DOWN => {
+                self.cy = self.row_offset + self.screen_rows - 1;
+                for _ in 0..self.screen_rows - 1 {
+                    self.move_cursor(ARROW_DOWN)
+                }
+            }
+            PAGE_UP => {
+                self.cy = self.row_offset;
+                for _ in 0..self.screen_rows - 1 {
+                    self.move_cursor(ARROW_UP)
+                }
+            }
+            HOME_KEY => {
+                self.cx = 0;
+                // for _ in 0..self.screen_cols - 1 {
+                //     self.move_cursor(ARROW_LEFT)
+                // }
+            }
+            END_KEY => {
+                self.cx = self.screen_cols - 1;
+                // for _ in 0..self.screen_cols - 1 {
+                //     self.move_cursor(ARROW_RIGHT)
+                // }
+            }
             // CTRL_KEY('q')
             17 => self.exit(),
             107 => self.refresh_screen(),
@@ -290,28 +299,49 @@ impl Editor {
     }
 
     fn move_cursor(&mut self, c: u16) {
+        let row_exists = self.cy < self.rows.len();
+        let row_size = if row_exists {
+            self.rows[self.cy].len()
+        } else {
+            0
+        };
         match c {
             ARROW_UP => {
-                if self.cy > 0 {
-                    self.cy = self.cy - 1
+                if self.cy != 0 {
+                    self.cy -= 1
                 }
             }
             ARROW_DOWN => {
-                if self.cy < self.screen_rows {
-                    self.cy = self.cy + 1
+                if self.cy < self.rows.len() {
+                    self.cy += 1
                 }
             }
             ARROW_LEFT => {
-                if self.cx > 1 {
-                    self.cx = self.cx - 1
+                if self.cx != 0 {
+                    self.cx -= 1;
+                } else if self.cy > 0 {
+                    self.cy -= 1;
+                    self.cx = self.rows[self.cy].len();
                 }
             }
             ARROW_RIGHT => {
-                if self.cx < self.screen_cols {
-                    self.cx = self.cx + 1
+                if self.cx < row_size {
+                    self.cx += 1
+                } else if row_exists && self.cx == row_size {
+                    self.cy += 1;
+                    self.cx = 0;
                 }
             }
             _ => (),
+        }
+        let new_row_exists = self.cy < self.rows.len();
+        let new_row_len = if new_row_exists {
+            self.rows[self.cy].len()
+        } else {
+            0
+        };
+        if self.cx > new_row_len {
+            self.cx = new_row_len;
         }
     }
 
@@ -324,13 +354,18 @@ impl Editor {
     }
 
     // *** OUTPUT ***
-    fn refresh_screen(&self) {
+    fn refresh_screen(&mut self) {
+        self.scroll();
         let mut output = String::new();
         // Hide cursor, Move to top left
         output.push_str("\x1b[?25l\x1b[H");
         // Clear rows and push new contents to output string
         self.draw_rows(&mut output);
-        let cursor_position = format!("\x1b[{0};{1}H", self.cy + 1, self.cx + 1);
+        let cursor_position = format!(
+            "\x1b[{0};{1}H",
+            (self.cy - self.row_offset) + 1,
+            (self.rx - self.col_offset) + 1
+        );
         // Move cursor to top left and show
         output.push_str(&cursor_position);
         output.push_str("\x1b[?25h");
@@ -338,32 +373,88 @@ impl Editor {
         stdout().write(output.as_bytes()).unwrap();
         stdout().flush().unwrap();
     }
-    fn draw_rows(&self, output: &mut String) {
-        let welcome_msg = concat!(
-            "ViMacs Editor -- Version ",
-            env!("CARGO_PKG_VERSION"),
-            "\r\n"
-        );
-        for i in 0..self.screen_rows - 1 {
-            if i == self.screen_rows / 3 {
-                if welcome_msg.len() > self.screen_cols {
-                    output.push_str(&welcome_msg[0..self.screen_cols]);
-                } else {
-                    let padding = (self.screen_cols - welcome_msg.len()) / 2;
-                    if padding > 0 {
-                        output.push_str("~");
-                    }
-                    for _ in 0..padding - 1 {
-                        output.push_str(" ");
-                    }
-                    output.push_str(&welcome_msg);
+    fn scroll(&mut self) {
+        self.rx = 0;
+        if self.cy < self.rows.len() {
+            self.rx = self.cx_to_rx(&self.rows[self.cy])
+        }
+        if self.cy < self.row_offset {
+            self.row_offset = self.cy;
+        }
+        if self.cy >= self.row_offset + self.screen_rows {
+            self.row_offset = self.cy - self.screen_rows + 1;
+        }
+        if self.rx < self.col_offset {
+            self.col_offset = self.rx;
+        }
+        if self.rx >= self.col_offset + self.screen_cols {
+            self.col_offset = self.rx - self.screen_cols + 1
+        }
+    }
+    fn cx_to_rx(&self, row: &str) -> usize {
+        let mut rx: usize = 0;
+        let end = std::cmp::min(self.cx, row.len());
+        for c in row[..end].chars() {
+            if c == '\t' {
+                rx += (self.tab_stop - 1) - (rx % self.tab_stop);
+            }
+            rx += 1;
+        }
+        rx
+        // if rx > 0 {
+        //     return rx;
+        // }
+        // 1
+    }
+    fn render_string(&self, target: &str) -> String {
+        let mut rendered = String::new();
+        for c in target.chars() {
+            if c == '\t' {
+                for _ in 0..self.tab_stop {
+                    rendered.push(' ');
                 }
             } else {
-                // Write a tilde, clear the rest of the line, then return and newline
-                output.push_str("~\x1b[K\r\n");
+                rendered.push(c);
             }
         }
-        output.push_str("~\x1b[K");
+        rendered
+    }
+    fn draw_rows(&self, output: &mut String) {
+        let welcome_msg = concat!("ViMacs Editor -- Version ", env!("CARGO_PKG_VERSION"));
+        for i in 0..self.screen_rows {
+            let current_row = i + self.row_offset;
+            if current_row >= self.rows.len() {
+                if self.rows.len() == 0 && i == self.screen_rows / 4 {
+                    if welcome_msg.len() > self.screen_cols {
+                        output.push_str(&welcome_msg[0..self.screen_cols]);
+                    } else {
+                        let padding = (self.screen_cols - welcome_msg.len()) / 2;
+                        if padding > 0 {
+                            output.push('~');
+                        }
+                        for _ in 0..padding - 1 {
+                            output.push(' ');
+                        }
+                        output.push_str(&welcome_msg);
+                    }
+                } else {
+                    // Write a tilde, clear the rest of the line, then return and newline
+                    output.push('~');
+                }
+            } else {
+                output.push('~');
+                let rendered_row = self.render_string(&self.rows[current_row]);
+                let end = std::cmp::min(self.screen_cols + self.col_offset - 1, rendered_row.len());
+                if self.col_offset < rendered_row.len() {
+                    output.push_str(&rendered_row[self.col_offset..end]);
+                }
+            }
+            if i == self.screen_rows - 1 {
+                output.push_str("\x1b[K");
+            } else {
+                output.push_str("\x1b[K\r\n");
+            }
+        }
     }
     fn clear_screen(&self) {
         // Clear screen, move cursor to top left
@@ -373,5 +464,9 @@ impl Editor {
 // *** INIT ***
 fn main() {
     let mut editor = Editor::new();
+    let args: Vec<String> = env::args().collect();
+    if args.len() >= 2 {
+        editor.open(&args[1]);
+    }
     editor.run()
 }
