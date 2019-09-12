@@ -33,6 +33,7 @@ const CTRL_H: u16 = 8;
 const RETURN: u16 = 13;
 const CTRL_L: u16 = 12;
 const CTRL_S: u16 = 19;
+const CTRL_F: u16 = 6;
 const QUIT_PRESSES: usize = 3;
 
 struct Editor {
@@ -82,13 +83,13 @@ impl Editor {
             rx: 0,
             prev_cx: 0,
             file_name: String::new(),
-            status_msg: String::from("Help: Ctrl-S = save | CTRL-q = quit"),
+            status_msg: String::from("Help: Ctrl-S = save | CTRL-q = quit | CTRL-f find"),
             msg_time: SystemTime::now(),
             dirty: false,
             quit_times: 3
             // version: "0.0.1",
         };
-        editor.enable_raw_mode();
+        editor.enable_raw_mode(false);
         editor.clear_screen();
         editor.get_window_size();
         editor.screen_rows -= 2;
@@ -107,7 +108,7 @@ impl Editor {
             .expect("Error reverting terminal to original state");
     }
 
-    fn enable_raw_mode(&self) {
+    fn enable_raw_mode(&self, timeout: bool) {
         // get and current terminal flags
         use termios::*;
         let mut raw = self.orig_termios.clone();
@@ -119,8 +120,10 @@ impl Editor {
         raw.c_cflag |= CS8;
         raw.c_lflag &= !(ECHO | ICANON | IEXTEN | ISIG);
         // Set timeout on reads
-        // raw.c_cc[VMIN] = 0;
-        // raw.c_cc[VTIME] = 1;
+        if timeout {
+            raw.c_cc[VMIN] = 0;
+            raw.c_cc[VTIME] = 1;
+        }
 
         // Set flags and return
         tcsetattr(self.stdin_fileno, TCSAFLUSH, &raw).expect("Error setting terminal to raw mode");
@@ -134,10 +137,14 @@ impl Editor {
             Ok(_) => {
                 match next[0] {
                     ESCAPE => {
+                        // enable read timeouts
+                        self.enable_raw_mode(true);
                         // Buffer for escape sequence.
                         let mut seq = [0; 3];
                         match stdin().read(&mut seq) {
                             Ok(_) => {
+                                // disable read timeouts
+                                self.enable_raw_mode(false);
                                 // if we get '[' at position zero it's a generated response
                                 if seq[0] == LEFT_BRACKET {
                                     if seq[1] >= '0' as u8 && seq[1] <= '9' as u8 {
@@ -203,11 +210,15 @@ impl Editor {
                                     ESCAPE as u16
                                 }
                             }
-                            Err(e) => match e.kind() {
-                                // If our read timed out, set c to zero
-                                ErrorKind::UnexpectedEof => 0,
-                                _ => panic!(e),
-                            },
+                            Err(e) => {
+                                // disable read timeouts
+                                self.enable_raw_mode(false);
+                                match e.kind() {
+                                    // If our read timed out, set c to zero
+                                    ErrorKind::UnexpectedEof => 0,
+                                    _ => panic!(e),
+                                }
+                            }
                         }
                     }
                     _ => next[0] as u16,
@@ -295,7 +306,11 @@ impl Editor {
 
     fn save(&mut self) {
         if self.file_name.len() == 0 {
-            return;
+            self.file_name = self.prompt("(ESC to cancel) Save as: ", None);
+            if self.file_name.len() == 0 {
+                self.update_status("Save Canceled");
+                return;
+            }
         }
         // This clone is unnecessary but keeps the borrow checker from complaining
         let orig_name = self.file_name.clone();
@@ -338,6 +353,63 @@ impl Editor {
         };
     }
     // *** INPUT ***
+
+    fn find_next(&mut self, query: &str) {
+        let start = if self.cy >= self.rows.len() {
+            0
+        } else {
+            self.cy
+        };
+        // Search from cursor to end
+        for i in start..self.rows.len() {
+            let row_result = if i == start {
+                if self.cx + 1 >= self.rows[i].len() {
+                    None
+                } else {
+                    self.rows[i][self.cx + 1..].find(&query)
+                }
+            } else {
+                self.rows[i].find(&query)
+            };
+            match row_result {
+                Some(index) => {
+                    self.cy = i;
+                    self.cx = index;
+                    self.update_status("");
+                    return;
+                }
+                None => (),
+            }
+        }
+        // Search from begining to cursor
+        for i in 0..=start {
+            let row_result = if i == start {
+                self.rows[i][..self.cx].find(&query)
+            } else {
+                self.rows[i].find(&query)
+            };
+            match row_result {
+                Some(index) => {
+                    self.cy = i;
+                    self.cx = index;
+                    self.update_status("");
+                    return;
+                }
+                None => (),
+            }
+        }
+        self.update_status(&format!("No occurances of '{}' found", query));
+    }
+    fn find(&mut self) {
+        let mut query = String::new();
+        loop {
+            query = self.prompt("(ESC to cancel) Search: ", Some(&query));
+            if query.len() == 0 {
+                return;
+            }
+            self.find_next(&query);
+        }
+    }
     fn insert_row(&mut self) {
         if self.cy >= self.rows.len() {
             self.rows.push(String::new());
@@ -380,11 +452,38 @@ impl Editor {
             self.cy -= 1;
         }
     }
+    fn prompt(&mut self, prompt: &str, prev_prompt: Option<&str>) -> String {
+        let mut input = match prev_prompt {
+            Some(s) => String::from(s),
+            None => String::new(),
+        };
+        loop {
+            self.update_status(&format!("{0}{1}", prompt, input));
+            self.refresh_screen();
+            let c = self.read_key();
+            if c == ESCAPE_U16 {
+                self.update_status("");
+                return String::new();
+            } else if c == DELETE_KEY || c == CTRL_H || c == BACKSPACE {
+                input.pop();
+            } else if c == RETURN && input.len() > 0 {
+                self.update_status("");
+                return input;
+            } else if c > 32 && c < 127 {
+                // If c is a printable ascii character
+                input.push(char::from(c as u8))
+            }
+        }
+    }
     fn process_keypress(&mut self) {
         let c = self.read_key();
+        if c == 0 {
+            return;
+        }
+        self.update_status("");
+
         match c {
             // Nothing - do nothing
-            0 => (),
             RETURN => {
                 self.insert_row();
                 self.move_cursor(ARROW_DOWN);
@@ -428,8 +527,9 @@ impl Editor {
                 self.exit()
             }
             CTRL_L => (),
+            CTRL_F => self.find(),
             ESCAPE_U16 => (),
-            0..=255 => {
+            9 | 32..=126 => {
                 self.insert_char(c);
                 self.move_cursor(ARROW_RIGHT)
             }
