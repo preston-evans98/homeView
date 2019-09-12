@@ -1,7 +1,9 @@
 use std::env;
-use std::fs::File;
+use std::fs::{self, File, OpenOptions};
 use std::io::{stdin, stdout, BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::path::Path;
+use std::time::{Duration, SystemTime};
 // use std::panic::catch_unwind;
 
 extern crate termios;
@@ -24,6 +26,14 @@ const END_KEY: u16 = 1007;
 const DELETE_KEY: u16 = 1008;
 const LEFT_BRACKET: u8 = 91;
 const ESCAPE: u8 = 27;
+const ESCAPE_U16: u16 = 27;
+const CTRL_Q: u16 = 17;
+const BACKSPACE: u16 = 127;
+const CTRL_H: u16 = 8;
+const RETURN: u16 = 13;
+const CTRL_L: u16 = 12;
+const CTRL_S: u16 = 19;
+const QUIT_PRESSES: usize = 3;
 
 struct Editor {
     orig_termios: Termios,
@@ -38,7 +48,13 @@ struct Editor {
     screen_cols: usize,
     tab_stop: usize,
     rx: usize,
+    prev_cx: usize,
     rows: Vec<String>, // version: &'static str
+    file_name: String,
+    status_msg: String,
+    msg_time: SystemTime,
+    dirty: bool,
+    quit_times: usize,
 }
 
 impl Drop for Editor {
@@ -57,18 +73,25 @@ impl Editor {
             // stdout_fileno: stdout().as_raw_fd(),
             screen_rows: 0,
             screen_cols: 0,
-            cx: 1,
+            cx: 0,
             cy: 0,
             row_offset: 0,
             col_offset: 0,
             rows: Vec::new(),
             tab_stop: 4,
             rx: 0,
+            prev_cx: 0,
+            file_name: String::new(),
+            status_msg: String::from("Help: Ctrl-S = save | CTRL-q = quit"),
+            msg_time: SystemTime::now(),
+            dirty: false,
+            quit_times: 3
             // version: "0.0.1",
         };
         editor.enable_raw_mode();
         editor.clear_screen();
         editor.get_window_size();
+        editor.screen_rows -= 2;
         editor
     }
 
@@ -96,8 +119,8 @@ impl Editor {
         raw.c_cflag |= CS8;
         raw.c_lflag &= !(ECHO | ICANON | IEXTEN | ISIG);
         // Set timeout on reads
-        raw.c_cc[VMIN] = 0;
-        raw.c_cc[VTIME] = 1;
+        // raw.c_cc[VMIN] = 0;
+        // raw.c_cc[VTIME] = 1;
 
         // Set flags and return
         tcsetattr(self.stdin_fileno, TCSAFLUSH, &raw).expect("Error setting terminal to raw mode");
@@ -258,14 +281,114 @@ impl Editor {
         for line in buf_reader.lines().map(|l| l.unwrap()) {
             self.rows.push(line);
         }
+        self.file_name.push_str(file_name);
     }
 
+    fn rows_to_string(&self) -> String {
+        let mut result = String::new();
+        for row in self.rows.iter() {
+            result.push_str(row);
+            result.push('\n');
+        }
+        result
+    }
+
+    fn save(&mut self) {
+        if self.file_name.len() == 0 {
+            return;
+        }
+        // This clone is unnecessary but keeps the borrow checker from complaining
+        let orig_name = self.file_name.clone();
+        let file_path = Path::new(&orig_name);
+        let old_extension = match file_path.extension() {
+            Some(ext) => match ext.to_str() {
+                Some(s) => s,
+                None => &"",
+            },
+            None => &"",
+        };
+        let temp_path =
+            file_path.with_file_name(file_path.with_extension(format!("{0}.lock", old_extension)));
+        let mut temp_file = match OpenOptions::new().write(true).create(true).open(&temp_path) {
+            Ok(f) => f,
+            Err(_) => {
+                self.update_status(&format!("Could not create lock file: {:?}", temp_path));
+                let _ = fs::remove_file(temp_path);
+                return;
+            }
+        };
+        match temp_file.write(self.rows_to_string().as_bytes()) {
+            Ok(_) => (),
+            Err(_) => {
+                self.update_status(&format!("Could not write to lock file: {:?}", temp_path));
+                let _ = fs::remove_file(&temp_path);
+                return;
+            }
+        };
+        match fs::rename(&temp_path, file_path) {
+            Ok(_) => {
+                let _ = fs::remove_file(temp_path);
+                self.update_status("Saved!");
+                self.dirty = false;
+            }
+            Err(_) => {
+                self.update_status(&format!("Could save file: {:?}", file_path));
+                let _ = fs::remove_file(&temp_path);
+            }
+        };
+    }
     // *** INPUT ***
+    fn insert_row(&mut self) {
+        if self.cy >= self.rows.len() {
+            self.rows.push(String::new());
+            return;
+        }
+        if self.cx < self.rows[self.cy].len() {
+            let next_row = self.rows[self.cy].split_off(self.cx);
+            self.rows.insert(self.cy + 1, next_row);
+        } else {
+            self.rows.insert(self.cy + 1, String::new());
+        }
+    }
+    fn insert_char(&mut self, c: u16) {
+        let new = char::from(c as u8);
+        if self.cy == self.rows.len() {
+            self.rows.push(String::new());
+        }
+        self.rows[self.cy].insert(self.cx, new);
+        self.dirty = true;
+    }
+    fn delete_row_char(&mut self, index: usize) {
+        if index >= self.rows[self.cy].len() {
+            return;
+        }
+        self.dirty = true;
+        self.rows[self.cy].remove(index);
+    }
+
+    fn delete_char(&mut self) {
+        if self.cy >= self.rows.len() {
+            return;
+        };
+        if self.cx > 0 {
+            self.delete_row_char(self.cx - 1);
+            self.cx -= 1;
+        } else if self.cy > 0 {
+            let delete_row = self.rows.remove(self.cy);
+            self.cx = self.rows[self.cy - 1].len();
+            self.rows[self.cy - 1].push_str(&delete_row);
+            self.cy -= 1;
+        }
+    }
     fn process_keypress(&mut self) {
         let c = self.read_key();
         match c {
             // Nothing - do nothing
             0 => (),
+            RETURN => {
+                self.insert_row();
+                self.move_cursor(ARROW_DOWN);
+            }
             ARROW_UP | ARROW_DOWN | ARROW_LEFT | ARROW_RIGHT => self.move_cursor(c),
             PAGE_DOWN => {
                 self.cy = self.row_offset + self.screen_rows - 1;
@@ -281,21 +404,38 @@ impl Editor {
             }
             HOME_KEY => {
                 self.cx = 0;
-                // for _ in 0..self.screen_cols - 1 {
-                //     self.move_cursor(ARROW_LEFT)
-                // }
             }
             END_KEY => {
-                self.cx = self.screen_cols - 1;
-                // for _ in 0..self.screen_cols - 1 {
-                //     self.move_cursor(ARROW_RIGHT)
-                // }
+                if self.cy < self.rows.len() {
+                    self.cx = self.rows[self.cy].len()
+                }
             }
-            // CTRL_KEY('q')
-            17 => self.exit(),
-            107 => self.refresh_screen(),
-            _ => println!("{}\r", c),
+            BACKSPACE | CTRL_H => self.delete_char(),
+            DELETE_KEY => {
+                self.move_cursor(ARROW_RIGHT);
+                self.delete_char();
+            }
+            CTRL_S => self.save(),
+            CTRL_Q => {
+                self.quit_times -= 1;
+                if self.quit_times > 0 && self.dirty {
+                    self.update_status(&format!(
+                        "WARNING! File has unsaved changes! Press Ctrl-Q {} more times to quit.",
+                        self.quit_times
+                    ));
+                    return;
+                }
+                self.exit()
+            }
+            CTRL_L => (),
+            ESCAPE_U16 => (),
+            0..=255 => {
+                self.insert_char(c);
+                self.move_cursor(ARROW_RIGHT)
+            }
+            _ => (),
         }
+        self.quit_times = QUIT_PRESSES;
     }
 
     fn move_cursor(&mut self, c: u16) {
@@ -310,14 +450,17 @@ impl Editor {
                 if self.cy != 0 {
                     self.cy -= 1
                 }
+                self.cx = std::cmp::max(self.cx, self.prev_cx);
             }
             ARROW_DOWN => {
                 if self.cy < self.rows.len() {
                     self.cy += 1
                 }
+                self.cx = std::cmp::max(self.cx, self.prev_cx);
             }
             ARROW_LEFT => {
-                if self.cx != 0 {
+                self.prev_cx = 0;
+                if self.cx > 0 {
                     self.cx -= 1;
                 } else if self.cy > 0 {
                     self.cy -= 1;
@@ -325,6 +468,7 @@ impl Editor {
                 }
             }
             ARROW_RIGHT => {
+                self.prev_cx = 0;
                 if self.cx < row_size {
                     self.cx += 1
                 } else if row_exists && self.cx == row_size {
@@ -341,6 +485,7 @@ impl Editor {
             0
         };
         if self.cx > new_row_len {
+            self.prev_cx = self.cx;
             self.cx = new_row_len;
         }
     }
@@ -354,6 +499,59 @@ impl Editor {
     }
 
     // *** OUTPUT ***
+    fn draw_status_bar(&self, output: &mut String) {
+        // Invert Colors
+        output.push_str("\x1b[7m");
+        let mut status: String = if self.file_name.len() == 0 {
+            format!("[No Name] - {0} lines", self.rows.len())
+        } else if self.file_name.len() <= 20 {
+            format!("{0} - {1} lines", self.file_name, self.rows.len())
+        } else {
+            format!("{0} - {1} lines", &self.file_name[..20], self.rows.len())
+        };
+        if self.dirty {
+            status.push_str(" (modified)");
+        }
+        let row_position = format!("{0}/{1}", self.cy + 1, self.rows.len());
+        while status.len() < self.screen_cols {
+            if self.screen_cols - status.len() == row_position.len() {
+                status.push_str(&row_position);
+                break;
+            }
+            status.push(' ');
+        }
+        if status.len() > self.screen_cols {
+            status.truncate(self.screen_cols);
+        }
+        output.push_str(&status);
+
+        // Turn off formatting changes from above
+        output.push_str("\x1b[m\r\n");
+        // output.push_str(&format!(
+        //     "\x1b[K   Cx: {0}, Rx: {1}, Col_Offset: {2}, Render at: {3}",
+        //     self.cx,
+        //     self.rx,
+        //     self.col_offset,
+        //     (self.rx - self.col_offset) + 1
+        // ));
+    }
+    fn update_status(&mut self, message: &str) {
+        self.status_msg = String::from(message);
+        self.msg_time = SystemTime::now();
+    }
+
+    fn draw_message_bar(&mut self, output: &mut String) {
+        output.push_str("\x1b[K");
+        if self.msg_time.elapsed().unwrap() > Duration::from_secs(5) {
+            return;
+        }
+        if self.status_msg.len() > self.screen_cols {
+            output.push_str(&self.status_msg[..self.screen_cols]);
+        } else {
+            output.push_str(&self.status_msg);
+        }
+    }
+
     fn refresh_screen(&mut self) {
         self.scroll();
         let mut output = String::new();
@@ -361,10 +559,12 @@ impl Editor {
         output.push_str("\x1b[?25l\x1b[H");
         // Clear rows and push new contents to output string
         self.draw_rows(&mut output);
+        self.draw_status_bar(&mut output);
+        self.draw_message_bar(&mut output);
         let cursor_position = format!(
             "\x1b[{0};{1}H",
             (self.cy - self.row_offset) + 1,
-            (self.rx - self.col_offset) + 1
+            (self.rx - self.col_offset) + 2
         );
         // Move cursor to top left and show
         output.push_str(&cursor_position);
@@ -401,10 +601,6 @@ impl Editor {
             rx += 1;
         }
         rx
-        // if rx > 0 {
-        //     return rx;
-        // }
-        // 1
     }
     fn render_string(&self, target: &str) -> String {
         let mut rendered = String::new();
@@ -449,11 +645,7 @@ impl Editor {
                     output.push_str(&rendered_row[self.col_offset..end]);
                 }
             }
-            if i == self.screen_rows - 1 {
-                output.push_str("\x1b[K");
-            } else {
-                output.push_str("\x1b[K\r\n");
-            }
+            output.push_str("\x1b[K\r\n");
         }
     }
     fn clear_screen(&self) {
