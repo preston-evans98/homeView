@@ -35,6 +35,8 @@ const CTRL_L: u16 = 12;
 const CTRL_S: u16 = 19;
 const CTRL_F: u16 = 6;
 const QUIT_PRESSES: usize = 3;
+const FORWARD: &str = "\x1b111";
+const BACKWARD: &str = "\x1b999";
 
 struct Editor {
     orig_termios: Termios,
@@ -353,6 +355,56 @@ impl Editor {
         };
     }
     // *** INPUT ***
+    fn search_reverse(&self, row: &str, query: &str) -> Option<usize> {
+        if row.len() < query.len() {
+            return None;
+        };
+        for i in (0..(row.len() - query.len())).rev() {
+            if &row[i..i + query.len()] == query {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    fn find_prev(&mut self, query: &str) {
+        let cur_x = if self.cx;
+        let mut cur_y = if self.cy > 0 {
+            self.cy - 1
+        } else {
+            self.rows.len()
+        };
+        if cur_y > self.rows.len() {
+            cur_y = self.rows.len();
+        }
+        // Search the current row up to the cursor
+        match self.search_reverse(&self.rows[cur_y][..cur_x], query) {
+            Some(index) => {
+                self.cy = cur_y;
+                self.cx = index;
+                self.update_status("");
+                return;
+            }
+            None => (),
+        }
+        // Search all other rows
+        for _ in 0..self.rows.len() {
+            match self.search_reverse(&self.rows[cur_y], query) {
+                Some(index) => {
+                    self.cy = cur_y;
+                    self.cx = index;
+                    self.update_status("");
+                    return;
+                }
+                None => (),
+            }
+            if cur_y == 0 {
+                cur_y = self.rows.len()
+            }
+            cur_y -= 1;
+        }
+        self.update_status(&format!("No occurances of '{}' found", query));
+    }
 
     fn find_next(&mut self, query: &str) {
         let start = if self.cy >= self.rows.len() {
@@ -407,7 +459,29 @@ impl Editor {
             if query.len() == 0 {
                 return;
             }
-            self.find_next(&query);
+            if query.len() > FORWARD.len() {
+                let end_real_query = query.len() - FORWARD.len();
+                match &query[end_real_query..] {
+                    FORWARD => {
+                        query.truncate(end_real_query);
+                        self.find_next(&query);
+                        continue;
+                    }
+                    _ => (),
+                }
+            }
+            if query.len() > BACKWARD.len() {
+                let end_real_query = query.len() - BACKWARD.len();
+                match &query[end_real_query..] {
+                    BACKWARD => {
+                        query.truncate(end_real_query);
+                        self.find_prev(&query);
+                        continue;
+                    }
+                    _ => (),
+                }
+            }
+            self.find_next(&query)
         }
     }
     fn insert_row(&mut self) {
@@ -466,12 +540,20 @@ impl Editor {
                 return String::new();
             } else if c == DELETE_KEY || c == CTRL_H || c == BACKSPACE {
                 input.pop();
-            } else if c == RETURN && input.len() > 0 {
+            } else if input.len() > 0 && c == RETURN {
                 self.update_status("");
                 return input;
             } else if c > 32 && c < 127 {
                 // If c is a printable ascii character
                 input.push(char::from(c as u8))
+            } else if input.len() > 0 && (c == ARROW_LEFT || c == ARROW_UP) {
+                self.update_status("");
+                input.push_str(BACKWARD);
+                return input;
+            } else if input.len() > 0 && (c == ARROW_RIGHT || c == ARROW_DOWN) {
+                self.update_status("");
+                input.push_str(FORWARD);
+                return input;
             }
         }
     }
