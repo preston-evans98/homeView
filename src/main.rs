@@ -35,8 +35,9 @@ const CTRL_L: u16 = 12;
 const CTRL_S: u16 = 19;
 const CTRL_F: u16 = 6;
 const QUIT_PRESSES: usize = 3;
-const FORWARD: &str = "\x1b111";
-const BACKWARD: &str = "\x1b999";
+const PROMPT_FORWARD: &str = "\x1b111";
+const PROMPT_BACKWARD: &str = "\x1b999";
+const PROMPT_DONE: &str = "\x1b000";
 
 struct Editor {
     orig_termios: Termios,
@@ -58,6 +59,9 @@ struct Editor {
     msg_time: SystemTime,
     dirty: bool,
     quit_times: usize,
+    saved_cx: usize,
+    saved_cy: usize,
+    just_searched: bool,
 }
 
 impl Drop for Editor {
@@ -88,7 +92,10 @@ impl Editor {
             status_msg: String::from("Help: Ctrl-S = save | CTRL-q = quit | CTRL-f find"),
             msg_time: SystemTime::now(),
             dirty: false,
-            quit_times: 3
+            quit_times: 3,
+            saved_cy: 0,
+            saved_cx: 0,
+            just_searched: false
             // version: "0.0.1",
         };
         editor.enable_raw_mode(false);
@@ -359,7 +366,7 @@ impl Editor {
         if row.len() < query.len() {
             return None;
         };
-        for i in (0..(row.len() - query.len())).rev() {
+        for i in (0..=(row.len() - query.len())).rev() {
             if &row[i..i + query.len()] == query {
                 return Some(i);
             }
@@ -367,25 +374,27 @@ impl Editor {
         None
     }
 
-    fn find_prev(&mut self, query: &str) {
-        let cur_x = if self.cx;
-        let mut cur_y = if self.cy > 0 {
-            self.cy - 1
+    // Returns bool found
+    fn find_prev(&mut self, query: &str) -> bool {
+        let mut cur_y = if self.cy < self.rows.len() {
+            self.cy
         } else {
-            self.rows.len()
+            self.rows.len() - 1
         };
-        if cur_y > self.rows.len() {
-            cur_y = self.rows.len();
-        }
+        let cur_x = std::cmp::min(self.cx + query.len() - 1, self.rows[cur_y].len());
         // Search the current row up to the cursor
         match self.search_reverse(&self.rows[cur_y][..cur_x], query) {
             Some(index) => {
                 self.cy = cur_y;
                 self.cx = index;
-                self.update_status("");
-                return;
+                return true;
             }
             None => (),
+        }
+        if cur_y == 0 {
+            cur_y = self.rows.len() - 1
+        } else {
+            cur_y -= 1;
         }
         // Search all other rows
         for _ in 0..self.rows.len() {
@@ -393,8 +402,7 @@ impl Editor {
                 Some(index) => {
                     self.cy = cur_y;
                     self.cx = index;
-                    self.update_status("");
-                    return;
+                    return true;
                 }
                 None => (),
             }
@@ -403,40 +411,42 @@ impl Editor {
             }
             cur_y -= 1;
         }
-        self.update_status(&format!("No occurances of '{}' found", query));
+        false
     }
 
-    fn find_next(&mut self, query: &str) {
+    // Returns bool found
+    fn find_next(&mut self, query: &str) -> bool {
         let start = if self.cy >= self.rows.len() {
             0
         } else {
-            self.cy
-        };
-        // Search from cursor to end
-        for i in start..self.rows.len() {
-            let row_result = if i == start {
-                if self.cx + 1 >= self.rows[i].len() {
-                    None
-                } else {
-                    self.rows[i][self.cx + 1..].find(&query)
-                }
+            if self.cy == 0 {
+                self.rows.len() - 1
             } else {
-                self.rows[i].find(&query)
-            };
-            match row_result {
+                self.cy
+            }
+        };
+        // search rest of current row
+        if self.cx + 1 < self.rows[start].len() {
+            if let Some(index) = self.rows[start][(self.cx + 1)..].find(&query) {
+                self.cx = index + self.cx + 1;
+                return true;
+            }
+        }
+        // Search from cursor to end
+        for i in (start + 1)..self.rows.len() {
+            match self.rows[i].find(&query) {
                 Some(index) => {
                     self.cy = i;
                     self.cx = index;
-                    self.update_status("");
-                    return;
+                    return true;
                 }
                 None => (),
             }
         }
         // Search from begining to cursor
         for i in 0..=start {
-            let row_result = if i == start {
-                self.rows[i][..self.cx].find(&query)
+            let row_result = if i == start && self.cx + query.len() < self.rows[i].len() {
+                self.rows[i][..self.cx + query.len()].find(&query)
             } else {
                 self.rows[i].find(&query)
             };
@@ -444,44 +454,55 @@ impl Editor {
                 Some(index) => {
                     self.cy = i;
                     self.cx = index;
-                    self.update_status("");
-                    return;
+                    return true;
                 }
                 None => (),
             }
         }
-        self.update_status(&format!("No occurances of '{}' found", query));
+        false
     }
     fn find(&mut self) {
         let mut query = String::new();
+        self.saved_cx = self.cx;
+        self.saved_cy = self.cy;
+        self.just_searched = true;
+        let mut found = true;
         loop {
-            query = self.prompt("(ESC to cancel) Search: ", Some(&query));
+            if found {
+                query = self.prompt("(Use ESC/Arrows/Enter) Search: ", Some(&query));
+            } else {
+                query = self.prompt("(ESC to quit) No results for: ", Some(&query));
+            }
             if query.len() == 0 {
+                // self.cx = saved_cx;
+                // self.cy = saved_cy;
                 return;
+            } else if self.rows.len() == 0 {
+                continue;
+            } else if query.ends_with(PROMPT_FORWARD) {
+                query.truncate(query.len() - PROMPT_FORWARD.len());
+                found = self.find_next(&query);
+            if found {
+                self.saved_cx = self.cx;
+                self.saved_cy = self.cy;
             }
-            if query.len() > FORWARD.len() {
-                let end_real_query = query.len() - FORWARD.len();
-                match &query[end_real_query..] {
-                    FORWARD => {
-                        query.truncate(end_real_query);
-                        self.find_next(&query);
-                        continue;
-                    }
-                    _ => (),
-                }
+            } else if query.ends_with(PROMPT_BACKWARD) {
+                query.truncate(query.len() - PROMPT_BACKWARD.len());
+                found = self.find_prev(&query);
+            if found {
+                self.saved_cx = self.cx;
+                self.saved_cy = self.cy;
             }
-            if query.len() > BACKWARD.len() {
-                let end_real_query = query.len() - BACKWARD.len();
-                match &query[end_real_query..] {
-                    BACKWARD => {
-                        query.truncate(end_real_query);
-                        self.find_prev(&query);
-                        continue;
-                    }
-                    _ => (),
-                }
+            } else if query.ends_with(PROMPT_DONE) {
+                query.truncate(query.len() - PROMPT_DONE.len());
+                found = self.find_next(&query);
+            if found {
+                self.saved_cx = self.cx;
+                self.saved_cy = self.cy;
             }
-            self.find_next(&query)
+            } else {
+                found = self.find_next(&query);
+            }
         }
     }
     fn insert_row(&mut self) {
@@ -526,8 +547,11 @@ impl Editor {
             self.cy -= 1;
         }
     }
-    fn prompt(&mut self, prompt: &str, prev_prompt: Option<&str>) -> String {
-        let mut input = match prev_prompt {
+    // This has two modes - Normal, when no previous prompt is passed
+    // And interactive, when the caller passes in a previous prompt
+    // In interactive mode, a value is returned after every key press
+    fn prompt(&mut self, prompt: &str, prev_input: Option<&str>) -> String {
+        let mut input = match prev_input {
             Some(s) => String::from(s),
             None => String::new(),
         };
@@ -540,19 +564,32 @@ impl Editor {
                 return String::new();
             } else if c == DELETE_KEY || c == CTRL_H || c == BACKSPACE {
                 input.pop();
+                if prev_input != None && input.len() > 0 {
+                    return input;
+                }
             } else if input.len() > 0 && c == RETURN {
                 self.update_status("");
+                if prev_input != None {
+                    input.push_str(PROMPT_DONE);
+                }
                 return input;
             } else if c > 32 && c < 127 {
                 // If c is a printable ascii character
-                input.push(char::from(c as u8))
+                input.push(char::from(c as u8));
+                if prev_input != None {
+                    return input;
+                }
             } else if input.len() > 0 && (c == ARROW_LEFT || c == ARROW_UP) {
                 self.update_status("");
-                input.push_str(BACKWARD);
+                if prev_input != None {
+                    input.push_str(PROMPT_BACKWARD);
+                }
                 return input;
             } else if input.len() > 0 && (c == ARROW_RIGHT || c == ARROW_DOWN) {
                 self.update_status("");
-                input.push_str(FORWARD);
+                if prev_input != None {
+                    input.push_str(PROMPT_FORWARD);
+                }
                 return input;
             }
         }
@@ -610,7 +647,13 @@ impl Editor {
             }
             CTRL_L => (),
             CTRL_F => self.find(),
-            ESCAPE_U16 => (),
+            ESCAPE_U16 => {
+                if self.just_searched {
+                    self.just_searched = false;
+                    self.cx = self.saved_cx;
+                    self.cy = self.saved_cy;
+                }
+            },
             9 | 32..=126 => {
                 self.insert_char(c);
                 self.move_cursor(ARROW_RIGHT)
