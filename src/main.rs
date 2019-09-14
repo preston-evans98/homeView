@@ -38,6 +38,121 @@ const QUIT_PRESSES: usize = 3;
 const PROMPT_FORWARD: &str = "\x1b111";
 const PROMPT_BACKWARD: &str = "\x1b999";
 const PROMPT_DONE: &str = "\x1b000";
+const TAB_STOP: usize = 4;
+
+struct Row {
+    text: String,
+    rendered: String,
+    highlight: String,
+}
+
+impl Row {
+    pub fn new() -> Row {
+        Row {
+            text: String::new(),
+            rendered: String::new(),
+            highlight: String::new(),
+        }
+    }
+
+    pub fn from(text: String) -> Row {
+        let mut row = Row {
+            text,
+            rendered: String::new(),
+            highlight: String::new(),
+        };
+        row.render();
+        row
+    }
+
+    pub fn len(&self) -> usize {
+        self.text.len()
+    }
+    fn get(&self, low: usize, high: usize) -> &str {
+        if low >= self.len() {
+            &""
+        } else if high >= self.len() {
+            &self.text[low..self.len()]
+        } else {
+            &self.text[low..high]
+        }
+    }
+    fn search(&self, query: &str) -> Option<usize> {
+        return self.text.find(query);
+    }
+    //search string after given index
+    fn search_from(&self, index: usize, query: &str) -> Option<usize> {
+        return self.get(index + 1, self.len()).find(query);
+    }
+    fn search_to(&self, index: usize, query: &str) -> Option<usize> {
+        return self.get(0, index + query.len()).find(query);
+    }
+    fn search_reverse(&self, query: &str) -> Option<usize> {
+        if self.len() < query.len() {
+            return None;
+        };
+        for i in (0..=(self.len() - query.len())).rev() {
+            if self.get(i, i + query.len()) == query {
+                return Some(i);
+            }
+        }
+        None
+    }
+    // Search row for query up to but not including index as a starting position for string
+    fn search_reverse_to(&self, index: usize, query: &str) -> Option<usize> {
+        for i in (0..index).rev() {
+            if self.get(i, i + query.len()) == query {
+                return Some(i);
+            }
+        }
+        None
+    }
+    fn split_off(&mut self, index: usize) -> Row {
+        let next_text = self.text.split_off(index);
+        self.render();
+        Row::from(next_text)
+    }
+    fn render(&mut self) {
+        let mut rendered = String::new();
+        for c in self.text.chars() {
+            if c == '\t' {
+                for _ in 0..TAB_STOP {
+                    rendered.push(' ');
+                }
+            } else if c.is_numeric() {
+                rendered.push_str("\x1b[31m");
+                rendered.push(c);
+                rendered.push_str("\x1b[39m");
+            } else {
+                rendered.push(c);
+            }
+        }
+        self.rendered = rendered;
+    }
+    fn insert(&mut self, index: usize, c: char) {
+        self.text.insert(index, c);
+        self.render();
+    }
+    fn join(&mut self, new: &Row) {
+        self.text.push_str(&new.text);
+        self.rendered.push_str(&new.rendered);
+    }
+    fn remove(&mut self, index: usize) {
+        self.text.remove(index);
+        self.render();
+    }
+    fn cx_to_rx(&self, cx: usize) -> usize {
+        let mut rx: usize = 0;
+        let end = std::cmp::min(cx, self.len());
+        for c in self.text[..end].chars() {
+            if c == '\t' {
+                rx += (TAB_STOP - 1) - (rx % TAB_STOP);
+            }
+            rx += 1;
+        }
+        rx
+    }
+}
 
 struct Editor {
     orig_termios: Termios,
@@ -50,10 +165,10 @@ struct Editor {
     col_offset: usize,
     screen_rows: usize,
     screen_cols: usize,
-    tab_stop: usize,
+    // tab_stop: usize,
     rx: usize,
     prev_cx: usize,
-    rows: Vec<String>, // version: &'static str
+    rows: Vec<Row>, // version: &'static str
     file_name: String,
     status_msg: String,
     msg_time: SystemTime,
@@ -85,7 +200,7 @@ impl Editor {
             row_offset: 0,
             col_offset: 0,
             rows: Vec::new(),
-            tab_stop: 4,
+            // tab_stop: 4,
             rx: 0,
             prev_cx: 0,
             file_name: String::new(),
@@ -299,7 +414,7 @@ impl Editor {
         let file = File::open(file_name).expect(&format!("Could not open {0}", file_name));
         let buf_reader = BufReader::new(file);
         for line in buf_reader.lines().map(|l| l.unwrap()) {
-            self.rows.push(line);
+            self.rows.push(Row::from(line));
         }
         self.file_name.push_str(file_name);
     }
@@ -307,7 +422,7 @@ impl Editor {
     fn rows_to_string(&self) -> String {
         let mut result = String::new();
         for row in self.rows.iter() {
-            result.push_str(row);
+            result.push_str(&row.text);
             result.push('\n');
         }
         result
@@ -362,60 +477,43 @@ impl Editor {
         };
     }
     // *** INPUT ***
-    fn search_reverse(&self, row: &str, query: &str) -> Option<usize> {
-        if row.len() < query.len() {
-            return None;
-        };
-        for i in (0..=(row.len() - query.len())).rev() {
-            if &row[i..i + query.len()] == query {
-                return Some(i);
-            }
-        }
-        None
-    }
 
     // Returns bool found
     fn find_prev(&mut self, query: &str) -> bool {
+        if self.rows.len() == 0 {
+            return false;
+        }
         let mut cur_y = if self.cy < self.rows.len() {
             self.cy
         } else {
             self.rows.len() - 1
         };
-        let cur_x = std::cmp::min(self.cx + query.len() - 1, self.rows[cur_y].len());
-        // Search the current row up to the cursor
-        match self.search_reverse(&self.rows[cur_y][..cur_x], query) {
-            Some(index) => {
+        // Search current row behind cursor
+        if let Some(index) = self.rows[cur_y].search_reverse_to(self.cx, query) {
+            self.cy = cur_y;
+            self.cx = index;
+            return true;
+        };
+        for _ in 0..self.rows.len() {
+            if cur_y != 0 {
+                cur_y -= 1;
+            } else {
+                cur_y = self.rows.len() - 1;
+            }
+            if let Some(index) = self.rows[cur_y].search_reverse(query) {
                 self.cy = cur_y;
                 self.cx = index;
                 return true;
-            }
-            None => (),
-        }
-        if cur_y == 0 {
-            cur_y = self.rows.len() - 1
-        } else {
-            cur_y -= 1;
-        }
-        // Search all other rows
-        for _ in 0..self.rows.len() {
-            match self.search_reverse(&self.rows[cur_y], query) {
-                Some(index) => {
-                    self.cy = cur_y;
-                    self.cx = index;
-                    return true;
-                }
-                None => (),
-            }
-            if cur_y == 0 {
-                cur_y = self.rows.len()
-            }
-            cur_y -= 1;
+            };
         }
         false
     }
 
     // Returns bool found
     fn find_next(&mut self, query: &str) -> bool {
+        if self.rows.len() == 0 {
+            return false;
+        }
         let start = if self.cy >= self.rows.len() {
             0
         } else {
@@ -427,37 +525,31 @@ impl Editor {
         };
         // search rest of current row
         if self.cx + 1 < self.rows[start].len() {
-            if let Some(index) = self.rows[start][(self.cx + 1)..].find(&query) {
+            if let Some(index) = self.rows[start].search_from(self.cx, query) {
                 self.cx = index + self.cx + 1;
                 return true;
             }
         }
         // Search from cursor to end
         for i in (start + 1)..self.rows.len() {
-            match self.rows[i].find(&query) {
-                Some(index) => {
-                    self.cy = i;
-                    self.cx = index;
-                    return true;
-                }
-                None => (),
+            if let Some(index) = self.rows[i].search(query) {
+                self.cy = i;
+                self.cx = index;
+                return true;
             }
         }
         // Search from begining to cursor
-        for i in 0..=start {
-            let row_result = if i == start && self.cx + query.len() < self.rows[i].len() {
-                self.rows[i][..self.cx + query.len()].find(&query)
-            } else {
-                self.rows[i].find(&query)
-            };
-            match row_result {
-                Some(index) => {
-                    self.cy = i;
-                    self.cx = index;
-                    return true;
-                }
-                None => (),
+        for i in 0..start {
+            if let Some(index) = self.rows[i].search(query) {
+                self.cy = i;
+                self.cx = index;
+                return true;
             }
+        }
+        if let Some(index) = self.rows[start].search_to(self.cx, query) {
+            self.cy = index;
+            self.cx = index;
+            return true;
         }
         false
     }
@@ -474,32 +566,28 @@ impl Editor {
                 query = self.prompt("(ESC to quit) No results for: ", Some(&query));
             }
             if query.len() == 0 {
-                // self.cx = saved_cx;
-                // self.cy = saved_cy;
                 return;
-            } else if self.rows.len() == 0 {
-                continue;
             } else if query.ends_with(PROMPT_FORWARD) {
                 query.truncate(query.len() - PROMPT_FORWARD.len());
                 found = self.find_next(&query);
-            if found {
-                self.saved_cx = self.cx;
-                self.saved_cy = self.cy;
-            }
+                if found {
+                    self.saved_cx = self.cx;
+                    self.saved_cy = self.cy;
+                }
             } else if query.ends_with(PROMPT_BACKWARD) {
                 query.truncate(query.len() - PROMPT_BACKWARD.len());
                 found = self.find_prev(&query);
-            if found {
-                self.saved_cx = self.cx;
-                self.saved_cy = self.cy;
-            }
+                if found {
+                    self.saved_cx = self.cx;
+                    self.saved_cy = self.cy;
+                }
             } else if query.ends_with(PROMPT_DONE) {
                 query.truncate(query.len() - PROMPT_DONE.len());
                 found = self.find_next(&query);
-            if found {
-                self.saved_cx = self.cx;
-                self.saved_cy = self.cy;
-            }
+                if found {
+                    self.saved_cx = self.cx;
+                    self.saved_cy = self.cy;
+                }
             } else {
                 found = self.find_next(&query);
             }
@@ -507,20 +595,20 @@ impl Editor {
     }
     fn insert_row(&mut self) {
         if self.cy >= self.rows.len() {
-            self.rows.push(String::new());
+            self.rows.push(Row::new());
             return;
         }
         if self.cx < self.rows[self.cy].len() {
             let next_row = self.rows[self.cy].split_off(self.cx);
             self.rows.insert(self.cy + 1, next_row);
         } else {
-            self.rows.insert(self.cy + 1, String::new());
+            self.rows.insert(self.cy + 1, Row::new());
         }
     }
     fn insert_char(&mut self, c: u16) {
         let new = char::from(c as u8);
         if self.cy == self.rows.len() {
-            self.rows.push(String::new());
+            self.rows.push(Row::new());
         }
         self.rows[self.cy].insert(self.cx, new);
         self.dirty = true;
@@ -543,7 +631,7 @@ impl Editor {
         } else if self.cy > 0 {
             let delete_row = self.rows.remove(self.cy);
             self.cx = self.rows[self.cy - 1].len();
-            self.rows[self.cy - 1].push_str(&delete_row);
+            self.rows[self.cy - 1].join(&delete_row);
             self.cy -= 1;
         }
     }
@@ -653,7 +741,7 @@ impl Editor {
                     self.cx = self.saved_cx;
                     self.cy = self.saved_cy;
                 }
-            },
+            }
             9 | 32..=126 => {
                 self.insert_char(c);
                 self.move_cursor(ARROW_RIGHT)
@@ -801,7 +889,7 @@ impl Editor {
     fn scroll(&mut self) {
         self.rx = 0;
         if self.cy < self.rows.len() {
-            self.rx = self.cx_to_rx(&self.rows[self.cy])
+            self.rx = self.rows[self.cy].cx_to_rx(self.cx);
         }
         if self.cy < self.row_offset {
             self.row_offset = self.cy;
@@ -815,30 +903,6 @@ impl Editor {
         if self.rx >= self.col_offset + self.screen_cols {
             self.col_offset = self.rx - self.screen_cols + 1
         }
-    }
-    fn cx_to_rx(&self, row: &str) -> usize {
-        let mut rx: usize = 0;
-        let end = std::cmp::min(self.cx, row.len());
-        for c in row[..end].chars() {
-            if c == '\t' {
-                rx += (self.tab_stop - 1) - (rx % self.tab_stop);
-            }
-            rx += 1;
-        }
-        rx
-    }
-    fn render_string(&self, target: &str) -> String {
-        let mut rendered = String::new();
-        for c in target.chars() {
-            if c == '\t' {
-                for _ in 0..self.tab_stop {
-                    rendered.push(' ');
-                }
-            } else {
-                rendered.push(c);
-            }
-        }
-        rendered
     }
     fn draw_rows(&self, output: &mut String) {
         let welcome_msg = concat!("ViMacs Editor -- Version ", env!("CARGO_PKG_VERSION"));
@@ -864,7 +928,7 @@ impl Editor {
                 }
             } else {
                 output.push('~');
-                let rendered_row = self.render_string(&self.rows[current_row]);
+                let rendered_row = &self.rows[current_row].rendered;
                 let end = std::cmp::min(self.screen_cols + self.col_offset - 1, rendered_row.len());
                 if self.col_offset < rendered_row.len() {
                     output.push_str(&rendered_row[self.col_offset..end]);
