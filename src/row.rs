@@ -18,7 +18,7 @@ fn is_separator(c: char) -> bool {
 fn is_separator_or_none(c: Option<char>) -> bool {
     match c {
         Some(ch) => is_separator(ch),
-        _ => true
+        _ => true,
     }
 }
 
@@ -145,6 +145,8 @@ impl Row {
     }
     pub fn update_highlight(&mut self, syntax: &mut Syntax) {
         let mut prev_was_separator = true;
+        let mut in_string = None;
+
         if self.highlight.len() < self.rendered.len() {
             self.highlight
                 .resize(self.rendered.len(), Highlight::Normal);
@@ -155,7 +157,7 @@ impl Row {
                 num_to_skip -= 1;
                 continue;
             }
-            if syntax.slcs_len() != 0 && syntax.in_string() == None {
+            if syntax.slcs_len() != 0 && in_string == None {
                 if self.get_render_slice(i, i + syntax.slcs_len()) == syntax.get_slcs() {
                     for j in i..self.rendered.len() {
                         self.highlight[j] = Highlight::Comment;
@@ -169,7 +171,8 @@ impl Row {
                 self.highlight[i - 1].clone()
             };
             if syntax.get_flags() & HIGHLIGHT_STRINGS != 0 {
-                if let Some(quote) = syntax.in_string() {
+                if let Some(quote) = in_string {
+                    // if let Some(quote) = syntax.in_string() {
                     self.highlight[i] = Highlight::Str;
                     if c == '\\' && i + 1 < self.rendered.len() {
                         self.highlight[i + 1] = Highlight::Str;
@@ -177,13 +180,15 @@ impl Row {
                         continue;
                     }
                     if c == quote {
-                        syntax.set_in_string(None);
+                        // syntax.set_in_string(None);
+                        in_string = None;
                     }
                     prev_was_separator = true;
                     continue;
                 } else {
                     if c == '"' || (syntax.get_flags() & ALLOW_SINGLE_QUOTE != 0 && c == '\'') {
-                        syntax.set_in_string(Some(c));
+                        // syntax.set_in_string(Some(c));
+                        in_string = Some(c);
                         self.highlight[i] = Highlight::Str;
                         continue;
                     }

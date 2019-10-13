@@ -37,6 +37,10 @@ pub const HIGHLIGHT_NUMBERS: u32 = 1;
 pub const HIGHLIGHT_STRINGS: u32 = (1 << 1);
 pub const ALLOW_SINGLE_QUOTE: u32 = (1 << 2);
 
+fn is_control(c: char) -> bool {
+    (c as u8) < 32 || (c as u8) == 127
+}
+
 #[derive(Clone, PartialEq)]
 pub enum Highlight {
     Normal,
@@ -53,7 +57,6 @@ pub struct Syntax {
     file_match: Vec<String>,
     single_line_comment_start: String,
     flags: u32,
-    in_string: Option<char>,
     keywords: Vec<String>,
 }
 
@@ -64,7 +67,6 @@ impl Syntax {
             file_match: vec![],
             single_line_comment_start: String::new(),
             flags: 0,
-            in_string: None,
             keywords: vec![],
         }
     }
@@ -80,8 +82,8 @@ impl Syntax {
             file_match: Syntax::c_hldb_extensions(),
             single_line_comment_start: String::from("//"),
             flags: HIGHLIGHT_NUMBERS | HIGHLIGHT_STRINGS | ALLOW_SINGLE_QUOTE,
-            in_string: None,
-            keywords: vec![String::from("switch"),
+            keywords: vec![
+                String::from("switch"),
                 String::from("if"),
                 String::from("while"),
                 String::from("for"),
@@ -103,8 +105,8 @@ impl Syntax {
                 String::from("char|"),
                 String::from("unsigned|"),
                 String::from("signed|"),
-                String::from("void|")
-            ]
+                String::from("void|"),
+            ],
         }]
     }
     pub fn get_slcs(&self) -> &str {
@@ -113,13 +115,7 @@ impl Syntax {
     pub fn slcs_len(&self) -> usize {
         self.single_line_comment_start.len()
     }
-    pub fn in_string(&self) -> Option<char> {
-        self.in_string
-    }
-    pub fn set_in_string(&mut self, c: Option<char>) {
-        self.in_string = c;
-    }
-    pub fn get_keywords(&self) -> &Vec<String>{
+    pub fn get_keywords(&self) -> &Vec<String> {
         &self.keywords
     }
 }
@@ -733,7 +729,8 @@ impl Editor {
                     self.cy = self.saved_cy;
                 }
             }
-            9 | 32..=126 => {
+            // 9 | 32..=126 => {
+            0..=126 => {
                 self.insert_char(c);
                 self.move_cursor(ARROW_RIGHT)
             }
@@ -933,6 +930,20 @@ impl Editor {
                 {
                     if i > rendered_row.len() {
                         break;
+                    }
+                    if is_control(c) {
+                        output.push_str("\x1b[7m");
+                        if (c as u8) <= 26 {
+                            let sym = ((c as u8) + 64) as char;
+                            output.push(sym);
+                        } else {
+                            output.push('?');
+                        }
+                        output.push_str("\x1b[m");
+                        output.push_str(&format!(
+                            "\x1b[{0}m",
+                            self.syntax_to_color(previous_highlight)
+                        ));
                     }
                     let current_highlight = self.rows[current_row].get_highlight_at(i);
                     if current_highlight != previous_highlight {
